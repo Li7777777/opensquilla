@@ -249,3 +249,75 @@ async def test_replayed_turn_keeps_user_message_binding(monkeypatch) -> None:
         assert sum(1 for t in users if t.startswith("First question A")) == 1
         assert not any("Second question B" in t for t in users)
         assert not any("Third question C" in t for t in users)
+
+
+class _UsageRecordingSink:
+    """Minimal sink: records the provider legs the turn pipeline accounts for."""
+
+    def __init__(self) -> None:
+        self.started: list[Any] = []
+
+    async def start(self, call: Any) -> None:
+        self.started.append(call)
+
+    async def finalize(self, call: Any, result: Any) -> None:
+        return None
+
+    async def mark_unknown(self, call: Any, reason: str) -> None:
+        return None
+
+
+@pytest.mark.asyncio
+async def test_router_control_replay_allocates_distinct_usage_identities(monkeypatch) -> None:
+    """A router-control replay must not reuse the first attempt's usage identity.
+
+    ``event_id`` is ``uuid5(f"opensquilla:usage:{execution_id}:{call_index}")`` and
+    the turn pipeline binds ``execution_id`` to ``turn_id``, while ``call_index``
+    counts per ``UsageAccountingScope``. A replay re-enters the pipeline with the
+    same ``turn_id`` and builds a fresh scope, so its first leg re-derives the
+    first attempt's identity. The ledger's start guard compares ``started_at_ms``
+    among the attribution fields, so the replayed leg is rejected as a reused
+    identity and the whole turn fails closed before the provider is called.
+    """
+    monkeypatch.setattr(squilla_router_step, "_get_strategy", lambda _cfg: _Strategy())
+    provider = _ReplayProvider()
+    sink = _UsageRecordingSink()
+    cfg = GatewayConfig(
+        llm={"provider": "openrouter"},
+        squilla_router=SquillaRouterConfig(
+            enabled=True,
+            rollout_phase="full",
+            require_router_runtime=False,
+            tiers=_router_tier_profile_defaults("openrouter"),
+        ),
+    )
+    runner = TurnRunner(
+        provider_selector=_Selector(provider),
+        tool_registry=get_default_registry(),
+        config=cfg,
+        usage_event_sink=sink,
+    )
+
+    events = [
+        event
+        async for event in runner.run(
+            "Use c3 for this",
+            "agent:main:router-control-replay-usage",
+            tool_context=ToolContext(is_owner=True, caller_kind=CallerKind.CLI),
+            history_has_persisted_user=False,
+            no_memory_capture=True,
+        )
+    ]
+
+    # Guard the premise: the replay really ran, at two different models.
+    assert len([e for e in events if isinstance(e, RouterControlReplayEvent)]) == 1
+    assert provider.calls == ["deepseek/deepseek-v4-pro", "anthropic/claude-opus-4.8"]
+
+    # Both provider legs are real spend and must both be accounted for.
+    assert len(sink.started) == 2
+    first, second = sink.started
+
+    # The identity each leg claims must be distinct, or the ledger rejects the
+    # second one and the user loses the turn.
+    assert (first.execution_id, first.call_index) != (second.execution_id, second.call_index)
+    assert first.event_id != second.event_id
